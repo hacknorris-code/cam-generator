@@ -1,0 +1,967 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Camera Bit Extractor</title>
+
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: system-ui, sans-serif;
+    }
+
+    body {
+      margin: 0;
+      padding: 24px;
+      background: #111;
+      color: #eee;
+    }
+
+    main {
+      max-width: 900px;
+      margin: auto;
+    }
+
+    h1 {
+      margin-top: 0;
+    }
+
+    video {
+      width: 100%;
+      max-height: 60vh;
+      object-fit: contain;
+      background: #000;
+      border-radius: 8px;
+    }
+
+    button {
+      margin-top: 16px;
+      padding: 12px 20px;
+      font-size: 16px;
+      border: 0;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+
+    #capture {
+      background: #4caf50;
+      color: white;
+    }
+
+    #capture:disabled {
+      background: #555;
+      cursor: not-allowed;
+    }
+
+    #status {
+      margin-top: 16px;
+      white-space: pre-wrap;
+      color: #bbb;
+    }
+
+    .info {
+      margin-top: 20px;
+      padding: 12px;
+      background: #1d1d1d;
+      border-radius: 6px;
+      font-family: monospace;
+      white-space: pre-wrap;
+    }
+
+    .images {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 20px;
+    }
+
+    .images img {
+      width: 100%;
+      background: #000;
+      border-radius: 6px;
+    }
+
+    @media (max-width: 700px) {
+      .images {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+
+<body>
+<main>
+  <h1>Camera Bit Extractor</h1>
+
+  <video id="preview" autoplay muted playsinline></video>
+
+  <button id="capture" disabled>
+    Take 2 pictures
+  </button>
+
+  <div id="status">Starting camera…</div>
+
+  <div class="info" id="cameraInfo"></div>
+
+  <div class="images">
+    <img id="image1" alt="First captured image">
+    <img id="image2" alt="Second captured image">
+  </div>
+
+  <!-- Hidden processing canvases -->
+  <canvas id="canvas1" hidden></canvas>
+  <canvas id="canvas2" hidden></canvas>
+</main>
+<!--
+<dialog popover="" id=statsDialog style="max-width: 90vw;max-height: 90vh;">
+  <pre id=stats></pre>
+</dialog>
+<script src=tests.js></script>-->
+<script>
+"use strict";
+
+/*
+  Camera Bit Extractor
+
+  Processing:
+
+  1. Capture two still images.
+  2. Convert both to grayscale.
+  3. Calculate mean lightness of image #1.
+  4.use the least significant bit of every grayscale pixel.
+  5. Compare corresponding bits:
+       - equal     => append nothing
+       - different => append bit from image #1
+  6. Download ASCII 0/1 data.
+*/
+
+
+const video = document.getElementById("preview");
+const captureButton = document.getElementById("capture");
+const status = document.getElementById("status");
+const cameraInfo = document.getElementById("cameraInfo");
+
+const image1 = document.getElementById("image1");
+const image2 = document.getElementById("image2");
+
+const canvas1 = document.getElementById("canvas1");
+const canvas2 = document.getElementById("canvas2");
+
+let stream = null;
+let track = null;
+let imageCapture = null;
+let photoCapabilities = null;
+
+
+/* ---------------------------------------------------------
+   Utility
+--------------------------------------------------------- */
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function setStatus(message) {
+  status.innerHTML = message;
+}
+
+// function for 2.txt stats file (chunking, then sha256) ↓
+async function messData(binaryString) {
+const input = new TextEncoder().encode(binaryString);
+const output = new Uint8Array(input.length);
+
+const chunkSize = 32; // SHA-256 produces 32 bytes per hash
+let offset = 0;
+let counter = 0;
+
+while (offset < input.length) {
+  const end = Math.min(offset + chunkSize, input.length);
+  const chunk = input.subarray(offset, end);
+  
+  // Append the counter to this chunk
+  const counterBytes = new Uint8Array(4);
+  new DataView(counterBytes.buffer).setUint32(0, counter);
+  
+  const toHash = new Uint8Array(chunk.length + counterBytes.length);
+  toHash.set(chunk);
+  toHash.set(counterBytes, chunk.length);
+  
+  // Hash the chunk
+  const hash = new Uint8Array(
+  await crypto.subtle.digest("SHA-256", toHash)
+  );
+  
+  // Copy as many hash bytes as needed
+  const n = Math.min(hash.length, output.length - offset);
+  output.set(hash.subarray(0, n), offset);
+  
+  offset = end;
+  counter++;
+  }
+  
+  return new Blob([output], {
+  type: "application/octet-stream"
+  });
+  }
+
+// // function with sha256 per each bitshift, uses more power and ram ↓
+// async function messData(binaryString) {
+//   const input = new TextEncoder().encode(binaryString);
+// 
+//   const output = new Uint8Array(input.length);
+// 
+//   let counter = 0;
+//   let offset = 0;
+// 
+//   while (offset < input.length) {
+//     // Hash: input + counter
+//     const counterBytes = new Uint8Array(4);
+//     new DataView(counterBytes.buffer).setUint32(0, counter);
+//     
+//     const toHash = new Uint8Array(input.length + 4);
+//     toHash.set(input);
+//     toHash.set(counterBytes, input.length);
+//     
+//     const hash = new Uint8Array(
+//     await crypto.subtle.digest("SHA-256", toHash)
+//     );
+//     
+//     const n = Math.min(hash.length, output.length - offset);
+//     output.set(hash.subarray(0, n), offset);
+//     
+//     offset += n;
+//     counter++;
+//   }
+//   
+//   return new Blob([output], { type: "application/octet-stream" });
+// }
+//   
+// // placebo function ↓
+// async function messData(binaryString) {
+//   // Pack the ASCII "01" bitstring into real binary bytes (8 bits per byte).
+//   // Result is opaque binary — Notepad will show garbage, not 0s and 1s.
+//   const len = binaryString.length;
+//   const byteLen = Math.ceil(len / 8);
+//   const bytes = new Uint8Array(byteLen);
+// 
+//   for (let i = 0; i < len; i++) {
+//     if (binaryString[i] === "1") {
+//       bytes[i >> 3] |= 1 << (7 - (i & 7));
+//     }
+//   }
+//   return new Blob([bytes], { type: "application/octet-stream" });
+// }
+
+/* ---------------------------------------------------------
+   Start camera
+--------------------------------------------------------- */
+
+async function startCamera() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error(
+      "getUserMedia() is unavailable. Use Chrome over HTTPS or localhost."
+    );
+  }
+
+  if (!("ImageCapture" in window)) {
+    throw new Error(
+      "ImageCapture API is unavailable in this browser."
+    );
+  }
+
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: {
+      facingMode: { ideal: "environment" }
+    },
+    audio: false
+  });
+
+  video.srcObject = stream;
+
+  await video.play();
+
+  track = stream.getVideoTracks()[0];
+
+  /*
+    Give Chrome a moment to populate camera capabilities.
+  */
+  await sleep(300);
+
+  imageCapture = new ImageCapture(track);
+
+  /*
+    Still-image capabilities.
+    These include the maximum imageWidth/imageHeight available
+    to takePhoto().
+  */
+  try {
+    photoCapabilities =
+      await imageCapture.getPhotoCapabilities();
+  } catch (err) {
+    console.warn("Could not get photo capabilities:", err);
+  }
+
+  showCameraCapabilities();
+
+  captureButton.disabled = false;
+
+  setStatus("Camera ready.");
+}
+
+
+/* ---------------------------------------------------------
+   Camera capabilities
+--------------------------------------------------------- */
+
+function showCameraCapabilities() {
+  const caps = track.getCapabilities
+    ? track.getCapabilities()
+    : {};
+
+  const lines = [];
+
+  lines.push(
+    `Camera: ${track.label || "unknown"}`
+  );
+
+  if (caps.iso) {
+    lines.push(
+      `ISO: ${caps.iso.min} – ${caps.iso.max}`
+    );
+  } else {
+    lines.push(
+      "ISO: not exposed by this camera/browser"
+    );
+  }
+
+  if (caps.exposureTime) {
+    lines.push(
+      `Exposure time: ${caps.exposureTime.min} – ${caps.exposureTime.max}`
+    );
+  } else {
+    lines.push(
+      "Exposure time: not exposed by this camera/browser"
+    );
+  }
+
+  if (photoCapabilities?.imageWidth) {
+    lines.push(
+      `Still width: ${photoCapabilities.imageWidth.min} – ` +
+      `${photoCapabilities.imageWidth.max}`
+    );
+  }
+
+  if (photoCapabilities?.imageHeight) {
+    lines.push(
+      `Still height: ${photoCapabilities.imageHeight.min} – ` +
+      `${photoCapabilities.imageHeight.max}`
+    );
+  }
+
+  cameraInfo.textContent = lines.join("\n");
+}
+
+
+/* ---------------------------------------------------------
+   Configure camera
+--------------------------------------------------------- */
+
+async function lockExposure() {
+  const caps = track.getCapabilities();
+  console.log("exposureTime range (100µs units):", caps.exposureTime);
+  console.log("iso range:", caps.iso);
+
+  const auto = track.getSettings();
+  console.log("auto chose:", auto.exposureTime, "→", auto.exposureTime * 0.1, "ms");
+
+  // 1. Mode switch FIRST, alone, then wait
+  await track.applyConstraints({ advanced: [{ exposureMode: "manual" }] });
+  await sleep(400);
+
+  // 2. Freeze the auto-chosen value instead of forcing min
+  const freeze = {};
+  if (auto.exposureTime > 1) freeze.exposureTime = auto.exposureTime;
+  if (caps.iso) freeze.iso = caps.iso.max;   // max ISO is fine — it adds noise
+  await track.applyConstraints({ advanced: [freeze] });
+  await sleep(400);
+
+  console.log("locked:", track.getSettings());
+}
+
+/* ---------------------------------------------------------
+   Build takePhoto settings
+--------------------------------------------------------- */
+
+function getPhotoSettings() {
+  const settings = {};
+
+  /*
+    Maximum still-image dimensions.
+
+    ImageCapture uses these as desired dimensions and the browser
+    selects the closest supported values.
+  */
+
+  if (photoCapabilities?.imageWidth) {
+    settings.imageWidth =
+      photoCapabilities.imageWidth.max;
+  }
+
+  if (photoCapabilities?.imageHeight) {
+    settings.imageHeight =
+      photoCapabilities.imageHeight.max;
+  }
+
+  /*
+    Disable flash where the camera exposes the option.
+    This keeps the two captures from introducing a large
+    artificial illumination difference.
+  */
+
+  if (photoCapabilities?.fillLightMode?.includes("off")) {
+    settings.fillLightMode = "off";
+  }
+
+  return settings;
+}
+
+
+/* ---------------------------------------------------------
+   Capture one still
+--------------------------------------------------------- */
+
+async function takeOnePhoto() {
+  const settings = getPhotoSettings();
+
+  return await imageCapture.takePhoto(settings);
+}
+
+
+/* ---------------------------------------------------------
+   Blob -> ImageData
+--------------------------------------------------------- */
+
+async function blobToImageData(blob, canvas) {
+  const bitmap = await createImageBitmap(blob);
+
+  /*
+    Use the actual captured dimensions.
+  */
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+
+  const ctx = canvas.getContext("2d", {
+    willReadFrequently: true
+  });
+
+  ctx.clearRect(
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
+
+  ctx.drawImage(bitmap, 0, 0);
+
+  bitmap.close();
+
+  return ctx.getImageData(
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
+}
+
+
+/* ---------------------------------------------------------
+   Grayscale
+
+   Uses standard luma approximation:
+
+       Y = 0.299R + 0.587G + 0.114B
+
+   The result is stored as one Uint8Array value per pixel.
+--------------------------------------------------------- */
+
+function grayscale(imageData) {
+  const { data, width, height } = imageData;
+
+  const gray = new Uint8Array(width * height);
+
+  let sum = 0;
+
+  for (let i = 0, p = 0; p < gray.length; p++, i += 4) {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+
+    const y =
+      Math.round(
+        g
+      );
+
+    gray[p] = y;
+    sum += y;
+  }
+
+  return {
+    gray,
+    width,
+    height,
+    mean: sum / gray.length
+  };
+}
+
+
+/* ---------------------------------------------------------
+   Resize/crop if the two still images aren't identical.
+
+   The processing requires corresponding pixels.
+
+   We use the common top-left rectangle. Normally both captures
+   from the same camera will have identical dimensions.
+--------------------------------------------------------- */
+
+function commonDimensions(a, b) {
+  return {
+    width: Math.min(a.width, b.width),
+    height: Math.min(a.height, b.height)
+  };
+}
+
+function cropGray(grayImage, width, height) {
+  if (
+    grayImage.width === width &&
+    grayImage.height === height
+  ) {
+    return grayImage.gray;
+  }
+
+  const result = new Uint8Array(width * height);
+
+  for (let y = 0; y < height; y++) {
+    const sourceOffset =
+      y * grayImage.width;
+
+    const targetOffset =
+      y * width;
+
+    result.set(
+      grayImage.gray.subarray(
+        sourceOffset,
+        sourceOffset + width
+      ),
+      targetOffset
+    );
+  }
+
+  return result;
+}
+
+
+/* ---------------------------------------------------------
+   High-lightness mode
+
+   "Reads lowest bits"
+
+   We interpret this as the least significant bit (bit 0)
+   of each grayscale pixel.
+
+   Example:
+
+     10010110 -> LSB = 0
+     10101101 -> LSB = 1
+--------------------------------------------------------- */
+
+function lowBitPlane(gray) {
+  const bits = new Uint8Array(gray.length);
+
+  for (let i = 0; i < gray.length; i++) {
+    bits[i] = gray[i] & 1;
+  }
+
+  return bits;
+}
+
+/* ---------------------------------------------------------
+   Pairwise operation
+
+   Literal interpretation of:
+
+     if both same -> drop
+     if differs   -> keep bit from first
+
+   "drop" means NO CHARACTER is emitted.
+
+   Therefore:
+
+       first  second  output
+         0      0       ""
+         0      1       "0"
+         1      0       "1"
+         1      1       ""
+
+--------------------------------------------------------- */
+
+function combineBits(bits1, bits2) {
+  const chunks = [];
+
+  /*
+    Building a giant JS string one character at a time can
+    become expensive for multi-megapixel images.
+
+    Store chunks and join them periodically.
+  */
+  let chunk = "";
+
+  for (let i = 0; i < bits1.length; i++) {
+    if (bits1[i] !== bits2[i]) {
+      chunk += bits1[i] ? "1" : "0";
+
+      if (chunk.length >= 65536) {
+        chunks.push(chunk);
+        chunk = "";
+      }
+    }
+  }
+
+  if (chunk.length) {
+    chunks.push(chunk);
+  }
+
+  return chunks.join("");
+}
+
+function textToBits(str) {
+if (!/^[01]*$/.test(str)) {
+return str
+}
+
+return new Uint8Array([...str].map(Number));
+}
+
+function bytesToBits(bytes) {
+  const bits = new Uint8Array(bytes.length * 8);
+  for (let i = 0; i < bytes.length; i++) {
+    for (let b = 0; b < 8; b++) {
+      bits[i * 8 + b] = (bytes[i] >> (7 - b)) & 1;
+    }
+  }
+  return bits;
+}
+
+
+/* ---------------------------------------------------------
+   Download text
+--------------------------------------------------------- */
+
+function downloadText(text, filename) {
+  let bytes;
+  if (typeof text ===  "string"){
+  const byteLen = Math.ceil(text.length / 8);
+  bytes = new Uint8Array(byteLen);
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] === "1" || text[i] === 1) {
+        bytes[i >> 3] |= 1 << (7 - (i & 7));
+      }
+    }
+  }else{
+    bytes = text
+  }
+  const blob = new Blob(
+    [bytes],
+    {
+      type: "application/octet-stream"
+    }
+  );
+
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+
+  setTimeout(() => {
+    URL.revokeObjectURL(url);
+  }, 10000);
+}
+
+/* ---------------------------------------------------------
+   Basic stats
+--------------------------------------------------------- */
+
+function calcEnt(array) {
+// Validate input
+  if (!Array.isArray(array) || array.length === 0) {
+    throw new Error("Input must be a non-empty array");
+  }
+
+  const total = array.length;
+  const ones = array.filter(v => v === 1).length;
+  const zeros = total - ones;
+
+  const p = ones / total;  // probability of 1
+  const q = zeros / total; // probability of 0
+
+  // Helper for safe log₂ (handles 0 case) 
+  const log2Safe = (prob) => prob === 0 ? 0 : Math.log2(prob);
+
+  // Shannon entropy
+  const shannon = -(p * log2Safe(p) + q * log2Safe(q));
+
+  // Min-entropy: -log₂(max(p, q))
+  const maxProb = Math.max(p, q);
+  const minEntropy = -log2Safe(maxProb);
+
+  return {
+    shannon,
+    minEntropy,
+    probabilities: { zero: q, one: p },
+    maxProb,
+    sampleSize: total,
+    total:{zero:zeros,one:ones}
+  };
+}
+
+
+/* ---------------------------------------------------------
+   Main capture/process function
+--------------------------------------------------------- */
+
+async function captureAndProcess() {
+  captureButton.disabled = true;
+
+  try {
+    /*
+      Capture two separate exposures as quickly as possible.
+
+      ImageCapture.takePhoto() performs a still exposure and
+      returns a Blob.
+    */
+
+    setStatus("Taking picture 1 / 2…");
+    await lockExposure()
+    await sleep(1)
+    const blob1 = await takeOnePhoto();
+
+    setStatus("Taking picture 2 / 2…");
+
+    await lockExposure()
+    const blob2 = await takeOnePhoto();
+
+    /*
+      Show captured images.
+    */
+    image1.src = URL.createObjectURL(blob1);
+    image2.src = URL.createObjectURL(blob2);
+
+    setStatus("Decoding images…");
+
+    const data1 =
+      await blobToImageData(blob1, canvas1);
+
+    const data2 =
+      await blobToImageData(blob2, canvas2);
+
+    /*
+      Convert both to grayscale.
+    */
+    setStatus("Converting to grayscale…");
+
+    const gray1 = grayscale(data1);
+    const gray2 = grayscale(data2);
+
+    /*
+      Lightness is represented as mean grayscale value / 255.
+    */
+
+    const lightnessPercent = (gray1.mean / 255) * 100;
+
+    /*
+      Make dimensions compatible.
+    */
+    const dimensions =
+      commonDimensions(gray1, gray2);
+
+    const pixels1 =
+      cropGray(
+        gray1,
+        dimensions.width,
+        dimensions.height
+      );
+      
+    const normStats = calcEnt(Array.from(bytesToBits(pixels1)))
+
+    console.log("1: ", normStats)
+    // example return:
+    // {
+    // "shannon": 0.6731504591082529,
+    // "minEntropy": 0.28078313426627377,
+    // "probabilities": {
+    //     "zero": 0.8231440708905513,
+    //     "one": 0.17685592910944867
+    // },
+    // "maxProb": 0.8231440708905513,
+    // "sampleSize": 74941440,
+    // "total": {
+    //     "zero": 61687602,
+    //     "one": 13253838
+    // }
+    // }
+
+    const pixels2 =
+      cropGray(
+        gray2,
+        dimensions.width,
+        dimensions.height
+      );
+
+    let bits1;
+    let bits2;
+
+    bits1 = lowBitPlane(pixels1);
+    bits2 = lowBitPlane(pixels2);
+
+    setStatus(
+      `Analyzing…\n` +
+      `Image 1 lightness: ${lightnessPercent.toFixed(3)}%\n`
+    );
+
+    /*
+      Pairwise comparison.
+    */
+    const result = combineBits(bits1, bits2);
+
+    const xorStats = calcEnt(Array.from(textToBits(result)))
+    console.log("2: ",xorStats)
+
+    //example return:
+    // {
+    // "shannon": 0.33908995024383526,
+    // "minEntropy": 0.09381956031673747,
+    // "probabilities": {
+    // "zero": 0.9370386361445177,
+    // "one": 0.06296136385548229
+    // },
+    // "maxProb": 0.9370386361445177,
+    // "sampleSize": 36260968,
+    // "total": {
+    // "zero": 33977928,
+    // "one": 2283040
+    // }
+    // }
+
+    const filename =
+      `camera-bits-${Date.now()}.bin`;
+
+    const result2 = await messData(result)
+    const bytes = new Uint8Array(await result2.arrayBuffer());
+    const ent = calcEnt(Array.from(bytesToBits(bytes)))
+
+    setStatus(
+      `Done.\n\n` +
+      `Image 1 lightness: ${lightnessPercent.toFixed(3)}%\n` +
+      `Image size used: ${dimensions.width} × ${dimensions.height}\n` +
+      `Input pixels: ${bits1.length.toLocaleString()}\n` +
+      `Output bits: ${result2.size.toLocaleString()}\n\n` +
+      `<B>Normal stats:</B>\n`+
+      `Zeros: ${normStats.total["zero"]} \nOnes: ${normStats.total["one"]}\n`+
+      `Min-entropy: ${normStats.minEntropy}\n` +
+      `Entropy: ${normStats.shannon}\n` +
+      `P(0): ${normStats.probabilities["zero"]} \nP(1): ${normStats.probabilities["one"]}\n\n`+
+      `<B>XOR stats:</B>\n`+
+      `Zeros: ${xorStats.total["zero"]} \nOnes: ${xorStats.total["one"]}\n`+
+      `Min-entropy: ${xorStats.minEntropy}\n` +
+      `Entropy: ${xorStats.shannon}\n` +
+      `P(0): ${xorStats.probabilities["zero"]} \nP(1): ${xorStats.probabilities["one"]}\n\n`+
+      `<B>SHA stats:</B>\n`+
+      `Zeros: ${ent.total["zero"]} \nOnes: ${ent.total["one"]}\n`+
+      `Min-entropy: ${ent.minEntropy}\n` +
+      `Entropy: ${ent.shannon}\n` +
+      `P(0): ${ent.probabilities["zero"]} \nP(1): ${ent.probabilities["one"]}\n`+
+      `<button id=btnRaw>download</button> <button id=btnXOR>download XOR</button> <button id=btnDownload>download cleaned</button>` /*+
+      `<button id=btnStats popovertarget="statsDialog">open full stats</button>`*/
+    );
+
+    // example return:
+    //
+    // Zeros: 18126708
+    // Ones: 18134260
+    // Min-entropy: 0.9996995640452289
+    // Entropy: 0.9999999687111413
+    // P(0): 0.4998958659901192
+    // P(1): 0.5001041340098809
+
+    document.getElementById("btnDownload").addEventListener('click', () => {
+      downloadText(result2, filename);
+    });
+
+    document.getElementById("btnRaw").addEventListener('click', () => {
+      downloadText(pixels1, filename);
+      });
+
+      document.getElementById("btnXOR").addEventListener('click', () => {
+      downloadText(result, filename);
+      });
+
+    // document.getElementById("btnStats").addEventListener('click', () => {
+    //   statsDialog.innerHTML = stsReport(bytes, filename);
+    // });
+
+  } catch (err) {
+    console.error(err);
+
+    setStatus(
+      `Error: ${err.name || "Error"}\n` +
+      `${err.message || err}`
+    );
+
+  } finally {
+    captureButton.disabled = false;
+  }
+}
+
+
+/* ---------------------------------------------------------
+   Button
+--------------------------------------------------------- */
+
+captureButton.addEventListener(
+  "click",
+  captureAndProcess
+);
+
+
+/* ---------------------------------------------------------
+   Start
+--------------------------------------------------------- */
+
+startCamera().catch(err => {
+  console.error(err);
+
+  setStatus(
+    `Could not start camera.\n\n` +
+    `${err.name || "Error"}: ` +
+    `${err.message || err}`
+  );
+});
+
+
+/* ---------------------------------------------------------
+   Cleanup
+--------------------------------------------------------- */
+
+window.addEventListener("beforeunload", () => {
+  if (stream) {
+    for (const t of stream.getTracks()) {
+      t.stop();
+    }
+  }
+});
+</script>
+</body>
+</html>
